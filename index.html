@@ -40,10 +40,31 @@
     display: block;
     touch-action: none;
   }
+
+  /* Invisible hit area for the twinkling heart drawn on the canvas (top-right) */
+  #start {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    width: 48px;
+    height: 48px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    cursor: pointer;
+    z-index: 5;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #start:focus-visible {
+    outline: 1px solid rgba(255, 255, 255, 0.45);
+    outline-offset: 2px;
+  }
 </style>
 </head>
 <body>
 <canvas id="stage"></canvas>
+<button id="start" type="button" aria-label="Bắt đầu đếm ngược sinh nhật"></button>
 
 <script>
 (function () {
@@ -157,25 +178,29 @@
   function buildParticles() {
     const count = Math.max(900, Math.min(3400, Math.floor((W * H) / (620 * DPR))));
     particles = [];
+    for (let i = 0; i < count; i++) particles.push(makeParticle());
+  }
+  function makeParticle() {
     const { minX, maxX, minY, maxY } = HEART_BOUNDS;
-    for (let i = 0; i < count; i++) {
-      let lx = 0, ly = 0;
-      for (let tries = 0; tries < 40; tries++) {
-        const rx = minX + Math.random() * (maxX - minX);
-        const ry = minY + Math.random() * (maxY - minY);
-        if (pointInHeart(rx, ry)) { lx = rx; ly = ry; break; }
-      }
-      const isSpark = Math.random() < 0.06;
-      particles.push({
-        homeX: lx, homeY: ly,
-        x: centerX + lx * heartScale, y: centerY + ly * heartScale,
-        vx: 0, vy: 0,
-        r: (isSpark ? 2.1 + Math.random() * 1.1 : 0.9 + Math.random() * 1.5) * DPR,
-        c: isSpark ? 2 : (Math.random() < 0.5 ? 0 : 1),
-        phase: Math.random() * Math.PI * 2,
-        wobble: 0.4 + Math.random() * 0.8
-      });
+    let lx = 0, ly = 0;
+    for (let tries = 0; tries < 40; tries++) {
+      const rx = minX + Math.random() * (maxX - minX);
+      const ry = minY + Math.random() * (maxY - minY);
+      if (pointInHeart(rx, ry)) { lx = rx; ly = ry; break; }
     }
+    const isSpark = Math.random() < 0.06;
+    return {
+      homeX: lx, homeY: ly,
+      x: centerX + lx * heartScale, y: centerY + ly * heartScale,
+      vx: 0, vy: 0,
+      r: (isSpark ? 2.1 + Math.random() * 1.1 : 0.9 + Math.random() * 1.5) * DPR,
+      c: isSpark ? 2 : (Math.random() < 0.5 ? 0 : 1),
+      phase: Math.random() * Math.PI * 2,
+      wobble: 0.4 + Math.random() * 0.8,
+      ox: null, oy: null,            // optional target (digit / greeting), offset from centre
+      free: false, a: 1,             // free = flying as firework debris; a = opacity
+      life: 0, maxLife: 1
+    };
   }
 
   // --- Color themes: right-click cycles between them, colors cross-fade ---
@@ -335,10 +360,10 @@
   function updateAndDrawShootingStars(dt, theme) {
     if (reduceMotion) return;
     starTimer += dt;
-    if (starTimer > nextStarAt && shootingStars.length < 2) {
+    if (starTimer > nextStarAt && shootingStars.length < (starRate > 1.5 ? 4 : 2)) {
       spawnShootingStar();
       starTimer = 0;
-      nextStarAt = 3.5 + Math.random() * 5;
+      nextStarAt = (3.5 + Math.random() * 5) / starRate;
     }
 
     for (let i = shootingStars.length - 1; i >= 0; i--) {
@@ -444,7 +469,7 @@
   });
   window.addEventListener('mouseup', () => { isDragging = false; lastTrailPos = null; });
   window.addEventListener('mouseleave', () => { pointer.active = false; isDragging = false; lastTrailPos = null; });
-  window.addEventListener('click', (e) => spawnBurst(e.clientX * DPR, e.clientY * DPR));
+  window.addEventListener('click', (e) => pointerAction(e.clientX * DPR, e.clientY * DPR));
   window.addEventListener('touchmove', (e) => {
     if (e.touches[0]) {
       setPointer(e.touches[0].clientX, e.touches[0].clientY);
@@ -456,10 +481,392 @@
       isDragging = true;
       lastTrailPos = null;
       setPointer(e.touches[0].clientX, e.touches[0].clientY);
-      spawnBurst(e.touches[0].clientX * DPR, e.touches[0].clientY * DPR);
+      pointerAction(e.touches[0].clientX * DPR, e.touches[0].clientY * DPR);
     }
   }, { passive: true });
   window.addEventListener('touchend', () => { isDragging = false; lastTrailPos = null; pointer.active = false; });
+
+  // ===================== Birthday sequence =====================
+  // idle -> countdown (10..1, digits drawn by the particles) -> boom (heart compresses, explodes,
+  // fireworks) -> celebrate (particles spell the greeting). The twinkling heart button starts it.
+  const GREETING = 'Chúc mừng sinh nhật vợ yêu';
+  const FONT_FAMILY = '"Inter", system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+  const COUNT_FROM = 10;
+  const BOOM_FUSE = 0.8;     // seconds the heart spends compressing before it explodes
+  const TEXT_AT = 3.2;       // seconds after the explosion before the particles spell the greeting
+  const MAX_SPARKS = 2200;
+
+  const startBtn = document.getElementById('start');
+  let state = 'idle';
+  let stateT = 0, countNum = COUNT_FROM, countTimer = 0, celebrateT = 0;
+  let exploded = false, rocketTimer = 0, flash = 0, starRate = 1;
+  let beatPhase = 0, beatCycle = 1.05;
+  let btnAlpha = 1, btnLive = true;
+  let rockets = [], sparks = [], shocks = [];
+  let targetCache = {};
+
+  const easeInOut = (t) => t * t * (3 - 2 * t);
+  const easeOut = (t) => 1 - (1 - t) * (1 - t);
+  function setState(s) { state = s; stateT = 0; }
+
+  // Renders text offscreen and samples it into ~one point per particle (device px, relative to
+  // the screen centre), so the existing spring physics can pull the particles into the glyphs.
+  function textTargets(lines, fontPx) {
+    const c = document.createElement('canvas');
+    const g = c.getContext('2d');
+    const font = `800 ${Math.round(fontPx)}px ${FONT_FAMILY}`;
+    g.font = font;
+    let maxW = 0;
+    for (const l of lines) maxW = Math.max(maxW, g.measureText(l).width);
+    const lineH = fontPx * 1.25;
+    const cw = Math.ceil(maxW + fontPx * 0.5);
+    const ch = Math.ceil(lineH * lines.length + fontPx * 0.5);
+    c.width = cw;
+    c.height = ch;
+    g.font = font;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillStyle = '#fff';
+    lines.forEach((l, i) => g.fillText(l, cw / 2, ch / 2 + (i - (lines.length - 1) / 2) * lineH));
+    const data = g.getImageData(0, 0, cw, ch).data;
+
+    let covered = 0, minX = cw, maxX = 0, minY = ch, maxY = 0;
+    for (let y = 0; y < ch; y++) {
+      for (let x = 0; x < cw; x++) {
+        if (data[(y * cw + x) * 4 + 3] > 128) {
+          covered++;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (!covered) return [];
+    const midX = (minX + maxX) / 2, midY = (minY + maxY) / 2;
+    const step = Math.max(1, Math.sqrt(covered / Math.max(1, particles.length)));
+    const pts = [];
+    for (let y = minY; y <= maxY; y += step) {
+      for (let x = minX; x <= maxX; x += step) {
+        const px = Math.min(cw - 1, Math.floor(x + Math.random() * step));
+        const py = Math.min(ch - 1, Math.floor(y + Math.random() * step));
+        if (data[(py * cw + px) * 4 + 3] > 128) pts.push([px - midX, py - midY]);
+      }
+    }
+    for (let i = pts.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = pts[i]; pts[i] = pts[j]; pts[j] = t;
+    }
+    return pts;
+  }
+
+  function numberTargets(n) {
+    const key = 'n' + n;
+    return targetCache[key] || (targetCache[key] = textTargets([String(n)], Math.min(H * 0.62, W * 0.46)));
+  }
+
+  function greetingTargets() {
+    if (targetCache.greet) return targetCache.greet;
+    const probe = document.createElement('canvas').getContext('2d');
+    probe.font = `800 100px ${FONT_FAMILY}`;
+    let lines = [GREETING];
+    let fontPx = Math.min(W * 0.88 / probe.measureText(GREETING).width * 100, H * 0.2);
+    if (fontPx < 40 * DPR) { // narrow screens: split into lines so the text can be bigger
+      lines = ['Chúc mừng sinh nhật', 'vợ yêu'];
+      let wMax = Math.max(...lines.map((l) => probe.measureText(l).width));
+      fontPx = Math.min(W * 0.86 / wMax * 100, H * 0.14);
+      if (fontPx < 48 * DPR) {
+        lines = ['Chúc mừng', 'sinh nhật', 'vợ yêu'];
+        wMax = Math.max(...lines.map((l) => probe.measureText(l).width));
+        fontPx = Math.min(W * 0.86 / wMax * 100, H * 0.1);
+      }
+    }
+    return (targetCache.greet = textTargets(lines, fontPx));
+  }
+
+  function assignTargets(pts) {
+    if (!pts.length) return;
+    for (let i = 0; i < particles.length; i++) {
+      const q = pts[i % pts.length];
+      particles[i].ox = q[0];
+      particles[i].oy = q[1];
+    }
+  }
+
+  function showNumber(n, burst) {
+    assignTargets(numberTargets(n));
+    beatPhase = 0; // land a heartbeat exactly on the tick
+    if (!burst || reduceMotion) return;
+    for (const p of particles) {
+      const ang = Math.atan2(p.y - centerY, p.x - centerX) + (Math.random() - 0.5) * 0.8;
+      const sp = (1.5 + Math.random() * 3.5) * DPR;
+      p.vx += Math.cos(ang) * sp;
+      p.vy += Math.sin(ang) * sp;
+    }
+    shocks.push({ x: centerX, y: centerY, life: 0, max: 0.8, r0: heartScale * 3, r1: heartScale * 15 });
+  }
+
+  function beginSequence() {
+    if (state !== 'idle' && state !== 'celebrate') return;
+    setState('countdown');
+    countNum = COUNT_FROM;
+    countTimer = 0;
+    exploded = false;
+    celebrateT = 0;
+    for (const p of particles) { p.free = false; p.a = 1; }
+    showNumber(countNum, true);
+  }
+
+  function startBoom() {
+    setState('boom');
+    exploded = false;
+    for (const p of particles) { p.ox = null; p.oy = null; }
+  }
+
+  function explode() {
+    exploded = true;
+    flash = reduceMotion ? 0 : 1;
+    rocketTimer = 0.15;
+    for (const p of particles) {
+      const ang = Math.atan2(p.y - centerY, p.x - centerX) + (Math.random() - 0.5) * 1.1;
+      const sp = (2.5 + Math.random() * 10) * DPR * (reduceMotion ? 0.5 : 1);
+      p.vx = Math.cos(ang) * sp;
+      p.vy = Math.sin(ang) * sp - 1.2 * DPR;
+      p.free = true;
+      p.life = 0;
+      p.maxLife = 1.6 + Math.random() * 1.6;
+    }
+    shocks.push({ x: centerX, y: centerY, life: 0, max: 0.9, r0: heartScale * 2, r1: heartScale * 24 });
+    spawnExplosion(centerX, centerY, themeIndex, true);
+    launchRocket();
+    launchRocket();
+  }
+
+  function growForGreeting() {
+    const want = Math.min(6500, Math.floor(particles.length * 2.2));
+    while (particles.length < want) {
+      const p = makeParticle();
+      p.a = 0;
+      particles.push(p);
+    }
+  }
+
+  function startCelebrate() {
+    setState('celebrate');
+    celebrateT = 0;
+    for (const p of particles) { p.free = false; p.a = 0; p.vx = 0; p.vy = 0; }
+    growForGreeting();
+    assignTargets(greetingTargets());
+  }
+
+  // Rockets rise with a trail and burst at their apex; some bursts are hearts.
+  function launchRocket() {
+    if (rockets.length >= 10) return;
+    const g = 0.12 * DPR;
+    const rise = H * (0.45 + Math.random() * 0.4);
+    rockets.push({
+      x: W * (0.12 + Math.random() * 0.76),
+      y: H + 8 * DPR,
+      vx: (Math.random() - 0.5) * 0.6 * DPR,
+      vy: -Math.sqrt(2 * g * rise),
+      g,
+      trail: [],
+      theme: Math.floor(Math.random() * THEMES.length),
+      heart: Math.random() < 0.35
+    });
+  }
+
+  function spawnExplosion(x, y, themeIdx, heart) {
+    const th = THEMES[themeIdx];
+    const sc = Math.max(0.65, Math.min(1.4, Math.min(W, H) / DPR / 700));
+    const n = heart ? 84 : 70 + Math.floor(Math.random() * 40);
+    for (let i = 0; i < n && sparks.length < MAX_SPARKS; i++) {
+      let vx, vy;
+      if (heart) {
+        const [hx, hy] = heartLocal((i / n) * Math.PI * 2, 1);
+        const k = 0.3 * DPR * sc * (0.96 + Math.random() * 0.08);
+        vx = hx * k;
+        vy = hy * k;
+      } else {
+        const a = Math.random() * Math.PI * 2;
+        const sp = (Math.random() < 0.7 ? 4.6 + Math.random() * 1.2 : 1 + Math.random() * 3.4) * DPR * sc;
+        vx = Math.cos(a) * sp;
+        vy = Math.sin(a) * sp;
+      }
+      sparks.push({
+        x, y, vx, vy,
+        life: 0,
+        maxLife: 1.3 + Math.random() * 0.9,
+        r: (1.1 + Math.random() * 1.3) * DPR,
+        c: Math.random() < 0.15 ? th.streak : th.burst[Math.random() < 0.5 ? 0 : 1]
+      });
+    }
+  }
+
+  function runRockets(dt, dense) {
+    rocketTimer -= dt;
+    if (rocketTimer > 0) return;
+    launchRocket();
+    rocketTimer = (dense ? 0.3 + Math.random() * 0.35 : 1.6 + Math.random() * 1.6) * (reduceMotion ? 2.5 : 1);
+  }
+
+  function updateSequence(dt) {
+    stateT += dt;
+    let cycleTarget = 1.05;
+    if (state === 'countdown') {
+      countTimer += dt;
+      const progress = Math.min(1, (COUNT_FROM - countNum + countTimer) / COUNT_FROM);
+      cycleTarget = 1.05 - 0.65 * progress; // heart beats faster as zero approaches
+      starRate = 1 + 3 * progress;
+      if (countTimer >= 1) {
+        countTimer -= 1;
+        countNum--;
+        if (countNum > 0) showNumber(countNum, true); else startBoom();
+      }
+    } else if (state === 'boom') {
+      cycleTarget = 0.3;
+      starRate = 3;
+      if (!exploded && stateT >= BOOM_FUSE) explode();
+      if (exploded) {
+        runRockets(dt, true);
+        if (stateT >= BOOM_FUSE + TEXT_AT) startCelebrate();
+      }
+    } else if (state === 'celebrate') {
+      celebrateT += dt;
+      cycleTarget = 1.0;
+      starRate = 2;
+      runRockets(dt, celebrateT < 3);
+    } else {
+      starRate = 1;
+    }
+    beatCycle += (cycleTarget - beatCycle) * Math.min(1, dt * 4);
+    beatPhase += dt / beatCycle;
+  }
+
+  function updateFireworks(dt, theme) {
+    const dtf = dt * 60;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+
+    for (let i = shocks.length - 1; i >= 0; i--) {
+      const s = shocks[i];
+      s.life += dt;
+      const t = s.life / s.max;
+      if (t >= 1) { shocks.splice(i, 1); continue; }
+      ctx.strokeStyle = rgbStr(theme.glow, 0.55 * (1 - t));
+      ctx.lineWidth = (1 + 3 * (1 - t)) * DPR;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r0 + (s.r1 - s.r0) * easeOut(t), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    for (let i = rockets.length - 1; i >= 0; i--) {
+      const r = rockets[i];
+      r.trail.push({ x: r.x, y: r.y });
+      if (r.trail.length > 14) r.trail.shift();
+      r.x += r.vx * dtf;
+      r.y += r.vy * dtf;
+      r.vy += r.g * dtf;
+      if (r.vy > -0.8 * DPR || r.y < H * 0.08) {
+        spawnExplosion(r.x, r.y, r.theme, r.heart);
+        rockets.splice(i, 1);
+        continue;
+      }
+      const col = THEMES[r.theme].streak;
+      for (let k = 0; k < r.trail.length; k++) {
+        const f = k / r.trail.length;
+        ctx.fillStyle = rgbStr(col, f * 0.6);
+        ctx.beginPath();
+        ctx.arc(r.trail[k].x, r.trail[k].y, (0.6 + f * 1.2) * DPR, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = rgbStr(col, 1);
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, 2 * DPR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    for (let i = sparks.length - 1; i >= 0; i--) {
+      const s = sparks[i];
+      s.life += dt;
+      if (s.life >= s.maxLife) { sparks[i] = sparks[sparks.length - 1]; sparks.pop(); continue; }
+      const drag = 1 - 0.028 * dtf;
+      s.vx *= drag;
+      s.vy = s.vy * drag + 0.022 * DPR * dtf;
+      s.x += s.vx * dtf;
+      s.y += s.vy * dtf;
+      const t = s.life / s.maxLife;
+      ctx.fillStyle = rgbStr(s.c, (1 - t) * (0.65 + 0.35 * Math.random()));
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r * (1 - t * 0.5), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // The little heart in the top-right corner, twinkling like the stars. The real <button> on top
+  // of it only provides the hit area, keyboard access and the accessible name.
+  function drawStartButton(theme, elapsed, dt) {
+    const target = (state === 'idle' || (state === 'celebrate' && celebrateT > 2.2)) ? 1 : 0;
+    btnAlpha += (target - btnAlpha) * Math.min(1, dt * 5);
+    const live = target === 1;
+    if (live !== btnLive) {
+      btnLive = live;
+      startBtn.style.pointerEvents = live ? 'auto' : 'none';
+      startBtn.tabIndex = live ? 0 : -1;
+    }
+    if (btnAlpha < 0.01) return;
+
+    const cx = W - 38 * DPR, cy = 38 * DPR;
+    const tw = reduceMotion ? 1 : 0.55 + 0.45 * Math.sin(elapsed * 2.1 + 1.3);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = btnAlpha;
+
+    const glowR = 24 * DPR;
+    const glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+    glow.addColorStop(0, rgbStr(theme.glow, 0.4 * tw));
+    glow.addColorStop(1, rgbStr(theme.glow, 0));
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(cx, cy, glowR, 0, Math.PI * 2);
+    ctx.fill();
+
+    const ray = (9 + 6 * tw) * DPR;
+    ctx.strokeStyle = rgbStr(theme.streak, 0.7 * tw);
+    ctx.lineWidth = 1 * DPR;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(cx - ray, cy); ctx.lineTo(cx + ray, cy);
+    ctx.moveTo(cx, cy - ray); ctx.lineTo(cx, cy + ray);
+    ctx.stroke();
+
+    ctx.fillStyle = rgbStr(theme.colors[2], 0.55 + 0.45 * tw);
+    heartPathAt(cx, cy, 0.5 * DPR * (0.92 + 0.1 * tw), 0);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function pointerAction(x, y) {
+    if (state === 'idle') spawnBurst(x, y);
+    else if (state === 'celebrate') spawnExplosion(x, y, Math.floor(Math.random() * THEMES.length), Math.random() < 0.4);
+  }
+  startBtn.addEventListener('click', (e) => { e.stopPropagation(); beginSequence(); });
+  startBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+  startBtn.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
+
+  // Rebuilt particles (after a resize) lose their targets, so restore them for the current state.
+  function reapplySequence() {
+    targetCache = {};
+    if (state === 'countdown') {
+      showNumber(countNum, false);
+    } else if (state === 'boom' || state === 'celebrate') {
+      rockets = []; sparks = []; shocks = [];
+      if (state === 'boom') { setState('celebrate'); celebrateT = 0; }
+      growForGreeting();
+      assignTargets(greetingTargets());
+    }
+  }
 
   // --- Sizing ---
   function resize() {
@@ -473,15 +880,15 @@
     heartScale = Math.min(W, H) / 34;
     buildParticles();
     buildStars();
+    reapplySequence();
   }
   window.addEventListener('resize', resize);
   resize();
 
   // --- Heartbeat rhythm: two pulses ("lub-dub") per cycle ---
-  function beatPulse(tSec) {
+  function beatPulse(beat) {
     if (reduceMotion) return 1;
-    const cycle = 1.05;
-    const phase = (tSec % cycle) / cycle;
+    const phase = beat - Math.floor(beat);
     const bump = (center, width, amp) => amp * Math.exp(-Math.pow((phase - center) / width, 2));
     return 1 + bump(0.05, 0.05, 0.085) + bump(0.24, 0.07, 0.045);
   }
@@ -515,6 +922,7 @@
     const dt = Math.min((now - last) / 1000, 0.05);
     last = now;
     elapsed += dt;
+    updateSequence(dt);
 
     const theme = currentTheme();
     if (themeT < 1) themeT = Math.min(1, themeT + dt / 0.8);
@@ -528,9 +936,15 @@
     ctx.fillStyle = grd;
     ctx.fillRect(0, 0, W, H);
 
+    if (flash > 0) {
+      ctx.fillStyle = rgbStr(theme.streak, flash * 0.28);
+      ctx.fillRect(0, 0, W, H);
+      flash = Math.max(0, flash - dt * 2.2);
+    }
+
     drawStars(theme, elapsed);
 
-    const pulse = beatPulse(elapsed);
+    const pulse = beatPulse(beatPhase);
 
     // ambient glow behind the heart, synced to the beat
     const glowR = heartScale * 15 * pulse;
@@ -578,14 +992,41 @@
     // particles
     ctx.globalCompositeOperation = 'lighter';
     const holeScale = CURSOR_HOLE_SCALE();
+    const heartMul = (state === 'boom' && !exploded) ? 1 - 0.45 * easeInOut(Math.min(1, stateT / BOOM_FUSE)) : 1;
+    const textPulse = 1 + (pulse - 1) * (state === 'celebrate' ? 0.35 : 0.7);
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
-      let tx = centerX + p.homeX * heartScale * pulse;
-      let ty = centerY + p.homeY * heartScale * pulse;
+
+      if (p.free) { // firework debris from the explosion: ballistic, fading out
+        p.life += dt;
+        const fa = 1 - p.life / p.maxLife;
+        p.vx *= 0.985;
+        p.vy = p.vy * 0.985 + 0.045 * DPR;
+        p.x += p.vx;
+        p.y += p.vy;
+        if (fa > 0) {
+          ctx.beginPath();
+          ctx.fillStyle = rgbStr(theme.colors[p.c], fa);
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        continue;
+      }
+
+      const hasText = p.ox !== null;
+      let tx, ty;
+      if (hasText) {
+        tx = centerX + p.ox * textPulse;
+        ty = centerY + p.oy * textPulse;
+      } else {
+        tx = centerX + p.homeX * heartScale * pulse * heartMul;
+        ty = centerY + p.homeY * heartScale * pulse * heartMul;
+      }
 
       if (!reduceMotion) {
-        tx += Math.sin(elapsed * p.wobble + p.phase) * 1.5 * DPR;
-        ty += Math.cos(elapsed * p.wobble * 0.8 + p.phase) * 1.5 * DPR;
+        const wob = (hasText ? 0.6 : 1.5) * DPR;
+        tx += Math.sin(elapsed * p.wobble + p.phase) * wob;
+        ty += Math.cos(elapsed * p.wobble * 0.8 + p.phase) * wob;
       }
 
       let ax = (tx - p.x) * SPRING_K;
@@ -608,12 +1049,15 @@
       p.x += p.vx;
       p.y += p.vy;
 
+      if (p.a < 1) p.a = Math.min(1, p.a + dt * 1.1);
       ctx.beginPath();
-      ctx.fillStyle = rgbStr(theme.colors[p.c], 1);
-      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fillStyle = rgbStr(theme.colors[p.c], p.a);
+      ctx.arc(p.x, p.y, state === 'celebrate' && hasText ? p.r * 0.72 : p.r, 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.globalCompositeOperation = 'source-over';
+
+    updateFireworks(dt, theme);
 
     // flying / trail mini hearts
     for (let i = bursts.length - 1; i >= 0; i--) {
@@ -634,6 +1078,8 @@
       ctx.fill();
       ctx.globalAlpha = 1;
     }
+
+    drawStartButton(theme, elapsed, dt);
 
     requestAnimationFrame(frame);
   }
