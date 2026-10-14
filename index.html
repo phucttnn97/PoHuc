@@ -217,7 +217,8 @@
       wobble: 0.4 + Math.random() * 0.8,
       ox: null, oy: null,            // optional target (digit / greeting), offset from centre
       free: false, a: 1,             // free = flying as firework debris; a = opacity
-      life: 0, maxLife: 1
+      life: 0, maxLife: 1,
+      rel: 0                         // greeting: seconds after celebrate start before it may move
     };
   }
 
@@ -511,6 +512,7 @@
   const FONT_FAMILY = '"Inter", system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
   const GREET_FONT = '"Dancing Script", "Segoe Script", "Brush Script MT", cursive';
   const GREET_WEIGHT = 700;
+  const WRITE_START = 0.5;   // seconds after the burst ends before the pen starts writing
   const COUNT_FROM = 10;
   const BOOM_FUSE = 0.8;     // seconds the heart spends compressing before it explodes
   const TEXT_AT = 3.2;       // seconds after the explosion before the particles spell the greeting
@@ -604,34 +606,163 @@
         fontPx = Math.min(W * 0.86 / wMax * 100, H * 0.1);
       }
     }
-    targetCache.greetLayout = { lines, fontPx };
-    return (targetCache.greet = textTargets(lines, fontPx, GREET_FONT, GREET_WEIGHT));
+    const pts = textTargets(lines, fontPx, GREET_FONT, GREET_WEIGHT);
+
+    // Per line: horizontal extent and mean glyph height per column, so the pen can follow the writing.
+    const n = lines.length, lineH = fontPx * 1.25, bin = Math.max(4, 6 * DPR);
+    const lineOf = (y) => Math.max(0, Math.min(n - 1, Math.round((y - pts.cy) / lineH + (n - 1) / 2)));
+    const info = lines.map((_, i) => ({ minX: Infinity, maxX: -Infinity, cy: pts.cy + (i - (n - 1) / 2) * lineH, bin }));
+    for (const q of pts) {
+      const L = info[lineOf(q[1])];
+      if (q[0] < L.minX) L.minX = q[0];
+      if (q[0] > L.maxX) L.maxX = q[0];
+    }
+    for (const L of info) {
+      if (!isFinite(L.minX)) { L.minX = -1; L.maxX = 1; }
+      const nb = Math.ceil((L.maxX - L.minX) / bin) + 1;
+      L.sum = new Float32Array(nb);
+      L.cnt = new Uint16Array(nb);
+    }
+    for (const q of pts) {
+      const L = info[lineOf(q[1])];
+      const b = Math.floor((q[0] - L.minX) / bin);
+      L.sum[b] += q[1];
+      L.cnt[b]++;
+    }
+    const perLine = n === 1 ? 3.8 : 1.7;
+    targetCache.greetLayout = { lines, fontPx, info, perLine, total: WRITE_START + n * perLine, lineOf };
+    return (targetCache.greet = pts);
   }
 
-  // The greeting itself: real glowing text laid exactly over the points the particles settle on.
-  let greetAlpha = 0;
+  function lineYAt(L, x) {
+    const b = Math.floor((x - L.minX) / L.bin);
+    for (let d = 0; d <= 8; d++) {
+      for (const bb of [b - d, b + d]) {
+        if (bb >= 0 && bb < L.cnt.length && L.cnt[bb]) return L.sum[bb] / L.cnt[bb];
+      }
+    }
+    return L.cy;
+  }
+
+  // Seconds (after the burst) at which the pen reaches the point a particle will settle on.
+  function scheduleGreetingRelease() {
+    const lay = targetCache.greetLayout;
+    if (!lay) return;
+    for (const p of particles) {
+      if (p.ox === null) { p.rel = 0; continue; }
+      const li = lay.lineOf(p.oy);
+      const L = lay.info[li];
+      const u = Math.max(0, Math.min(1, (p.ox - L.minX) / Math.max(1, L.maxX - L.minX)));
+      p.rel = Math.max(0, WRITE_START + (li + u) * lay.perLine - 0.5); // set off a little ahead of the pen
+    }
+  }
+
+  // The greeting written out by a pen: a glowing tip travels along each line and real text is
+  // revealed behind it (soft, slanted edge), sitting exactly on the points the particles settle on.
+  let greetAlpha = 0, penY = 0, penLine = -1;
   function drawGreeting(theme, pulse, dt) {
-    const target = state === 'celebrate' ? easeInOut(Math.min(1, Math.max(0, (celebrateT - 1.6) / 1.2))) : 0;
-    greetAlpha += (target - greetAlpha) * Math.min(1, dt * (target > greetAlpha ? 8 : 5));
+    const inCelebrate = state === 'celebrate';
+    greetAlpha += ((inCelebrate ? 1 : 0) - greetAlpha) * Math.min(1, dt * (inCelebrate ? 20 : 5));
     const pts = targetCache.greet, lay = targetCache.greetLayout;
     if (greetAlpha < 0.01 || !pts || !lay) return;
+    const t = inCelebrate ? celebrateT : Infinity;
     const s = 1 + (pulse - 1) * 0.35;
-    const lineH = lay.fontPx * 1.25;
-    const n = lay.lines.length;
+    const n = lay.lines.length, lineH = lay.fontPx * 1.25;
+    const pad = lay.fontPx * 0.06, slant = lay.fontPx * 0.22;
+    const soft = [[lay.fontPx * 0.45, 0.22], [lay.fontPx * 0.22, 0.4]];
+
     ctx.save();
     ctx.translate(centerX, centerY);
     ctx.scale(s, s);
     ctx.font = `${GREET_WEIGHT} ${Math.round(lay.fontPx)}px ${GREET_FONT}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.globalAlpha = greetAlpha;
     ctx.fillStyle = rgbStr(theme.streak, 1);
-    ctx.shadowColor = rgbStr(theme.glow, 0.95);
-    ctx.shadowBlur = (16 + (pulse - 1) * 120) * DPR;
-    lay.lines.forEach((l, i) => ctx.fillText(l, pts.cx, pts.cy + (i - (n - 1) / 2) * lineH));
-    ctx.shadowBlur = 0;
-    ctx.shadowColor = 'transparent';
-    lay.lines.forEach((l, i) => ctx.fillText(l, pts.cx, pts.cy + (i - (n - 1) / 2) * lineH));
+
+    const drawLine = (i, glow) => {
+      const y = pts.cy + (i - (n - 1) / 2) * lineH;
+      if (glow) {
+        ctx.shadowColor = rgbStr(theme.glow, 0.95);
+        ctx.shadowBlur = (16 + (pulse - 1) * 120) * DPR;
+        ctx.fillText(lay.lines[i], pts.cx, y);
+        ctx.shadowBlur = 0;
+        ctx.shadowColor = 'transparent';
+      }
+      ctx.fillText(lay.lines[i], pts.cx, y);
+    };
+
+    let pen = null;
+    for (let i = 0; i < n; i++) {
+      const u = Math.min(1, Math.max(0, (t - WRITE_START - i * lay.perLine) / lay.perLine));
+      if (u <= 0) continue;
+      if (u >= 1) { // finished line: full text, no clipping
+        ctx.globalAlpha = greetAlpha;
+        drawLine(i, true);
+        continue;
+      }
+      const L = lay.info[i];
+      const ly = L.cy, top = ly - lineH * 0.75, bot = ly + lineH * 0.75;
+      const x0 = L.minX - pad - 2 * slant;
+      const penX = L.minX - pad - slant + u * (L.maxX - L.minX + 2 * pad + 2 * slant);
+      for (const [off, a, main] of [[soft[0][0], soft[0][1], false], [soft[1][0], soft[1][1], false], [0, 1, true]]) {
+        ctx.save();
+        const rx = penX + off;
+        ctx.beginPath();
+        ctx.moveTo(x0, top);
+        ctx.lineTo(rx + slant, top);
+        ctx.lineTo(rx - slant, bot);
+        ctx.lineTo(x0, bot);
+        ctx.closePath();
+        ctx.clip();
+        ctx.globalAlpha = greetAlpha * a;
+        drawLine(i, main);
+        ctx.restore();
+      }
+      pen = { i, L, x: penX, top, bot };
+    }
+
+    if (pen) { // the pen tip: bright glow that follows the height of the letters
+      const L = pen.L;
+      const target = lineYAt(L, Math.min(L.maxX, Math.max(L.minX, pen.x)));
+      if (penLine !== pen.i) { penLine = pen.i; penY = target; }
+      penY += (target - penY) * Math.min(1, dt * 16);
+      const tx = pen.x + slant * (1 - 2 * (penY - pen.top) / (pen.bot - pen.top));
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = greetAlpha;
+      const gr = 30 * DPR;
+      const g = ctx.createRadialGradient(tx, penY, 0, tx, penY, gr);
+      g.addColorStop(0, rgbStr(theme.streak, 0.95));
+      g.addColorStop(0.25, rgbStr(theme.glow, 0.5));
+      g.addColorStop(1, rgbStr(theme.glow, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(tx, penY, gr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = rgbStr(theme.streak, 0.8);
+      ctx.lineWidth = 1 * DPR;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(tx - 11 * DPR, penY); ctx.lineTo(tx + 11 * DPR, penY);
+      ctx.moveTo(tx, penY - 11 * DPR); ctx.lineTo(tx, penY + 11 * DPR);
+      ctx.stroke();
+      if (!reduceMotion) { // a few sparks trail off the tip
+        const wx = centerX + s * tx, wy = centerY + s * penY;
+        const count = Math.max(1, Math.round(dt * 110));
+        for (let k = 0; k < count && sparks.length < MAX_SPARKS; k++) {
+          sparks.push({
+            x: wx, y: wy,
+            vx: (Math.random() - 0.75) * 1.4 * DPR,
+            vy: (Math.random() - 0.35) * 1.4 * DPR,
+            life: 0,
+            maxLife: 0.5 + Math.random() * 0.5,
+            r: (0.8 + Math.random() * 1.1) * DPR,
+            c: Math.random() < 0.5 ? theme.streak : theme.burst[Math.random() < 0.5 ? 0 : 1]
+          });
+        }
+      }
+    } else {
+      penLine = -1;
+    }
     ctx.restore();
   }
 
@@ -701,7 +832,7 @@
   }
 
   function growForGreeting() {
-    const want = Math.min(6500, Math.floor(particles.length * 2.2));
+    const want = Math.min(4200, Math.floor(particles.length * 1.5)); // real text carries legibility now
     while (particles.length < want) {
       const p = makeParticle();
       p.a = 0;
@@ -712,9 +843,11 @@
   function startCelebrate() {
     setState('celebrate');
     celebrateT = 0;
+    greetAlpha = 1;
     for (const p of particles) { p.free = false; p.a = 0; p.vx = 0; p.vy = 0; }
     growForGreeting();
     assignTargets(greetingTargets());
+    scheduleGreetingRelease();
   }
 
   // Rockets rise with a trail and burst at their apex; some bursts are hearts.
@@ -865,7 +998,7 @@
   // The little heart in the top-right corner, twinkling like the stars. The real <button> on top
   // of it only provides the hit area, keyboard access and the accessible name.
   function drawStartButton(theme, elapsed, dt) {
-    const target = (state === 'idle' || (state === 'celebrate' && celebrateT > 2.2)) ? 1 : 0;
+    const target = (state === 'idle' || (state === 'celebrate' && targetCache.greetLayout && celebrateT > targetCache.greetLayout.total + 1)) ? 1 : 0;
     btnAlpha += (target - btnAlpha) * Math.min(1, dt * 5);
     const live = target === 1;
     if (live !== btnLive) {
@@ -923,6 +1056,8 @@
       if (state === 'boom') { setState('celebrate'); celebrateT = 0; }
       growForGreeting();
       assignTargets(greetingTargets());
+      for (const p of particles) p.rel = 0;
+      celebrateT = Math.max(celebrateT, targetCache.greetLayout.total + 1.5);
     }
   }
 
@@ -1054,6 +1189,8 @@
     const holeScale = CURSOR_HOLE_SCALE();
     const heartMul = (state === 'boom' && !exploded) ? 1 - 0.45 * easeInOut(Math.min(1, stateT / BOOM_FUSE)) : 1;
     const textPulse = 1 + (pulse - 1) * (state === 'celebrate' ? 0.35 : 0.7);
+    const gl = targetCache.greetLayout;
+    const greetDim = state === 'celebrate' && gl ? 0.65 * Math.min(1, Math.max(0, celebrateT - gl.total)) : 0;
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
 
@@ -1074,6 +1211,7 @@
       }
 
       const hasText = p.ox !== null;
+      if (state === 'celebrate' && hasText && celebrateT < p.rel) continue; // not yet reached by the pen
       let tx, ty;
       if (hasText) {
         tx = centerX + p.ox * textPulse;
@@ -1112,7 +1250,7 @@
       if (p.a < 1) p.a = Math.min(1, p.a + dt * 1.1);
       ctx.beginPath();
       const inGreeting = state === 'celebrate' && hasText;
-      ctx.fillStyle = rgbStr(theme.colors[p.c], inGreeting ? p.a * (1 - 0.65 * greetAlpha) : p.a);
+      ctx.fillStyle = rgbStr(theme.colors[p.c], inGreeting ? p.a * (1 - greetDim) : p.a);
       ctx.arc(p.x, p.y, inGreeting ? p.r * 0.72 : p.r, 0, Math.PI * 2);
       ctx.fill();
     }
